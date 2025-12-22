@@ -1,13 +1,13 @@
+// src/index.ts
+import "dotenv/config";
+
 import express from "express";
 import cors from "cors";
-import dotenv from "dotenv";
 import bcrypt from "bcrypt";
 import { z } from "zod";
 
 import { pool } from "./db.js";
 import { signToken, requireAuth, requireAdmin } from "./auth.js";
-
-dotenv.config();
 
 const app = express();
 app.use(cors());
@@ -96,7 +96,9 @@ app.post("/auth/register-admin", async (req, res) => {
     `SELECT * FROM users WHERE email = $1 LIMIT 1`,
     [email]
   );
-  if (existing.rows.length > 0) return res.status(409).json({ error: "Email already in use" });
+  if (existing.rows.length > 0) {
+    return res.status(409).json({ error: "Email already in use" });
+  }
 
   const passwordHash = await bcrypt.hash(password, 10);
 
@@ -187,7 +189,9 @@ app.post("/admin/create-user", requireAuth, requireAdmin, async (req, res) => {
     `SELECT * FROM users WHERE username = $1 LIMIT 1`,
     [username]
   );
-  if (existing.rows.length > 0) return res.status(409).json({ error: "Username already in use" });
+  if (existing.rows.length > 0) {
+    return res.status(409).json({ error: "Username already in use" });
+  }
 
   const passwordHash = await bcrypt.hash(password, 10);
 
@@ -213,8 +217,9 @@ async function start() {
     app.listen(PORT, "0.0.0.0", () => {
       console.log(`✅ Running on port ${PORT}`);
     });
-  } catch (e: any) {
-    console.error("❌ Startup error:", e?.message ?? e);
+  } catch (e) {
+    console.error("❌ Startup error (raw):", e);
+    if (e instanceof Error) console.error(e.stack);
     process.exit(1);
   }
 }
