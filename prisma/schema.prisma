@@ -1,0 +1,85 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Role {
+  ADMIN
+  USER
+}
+
+model User {
+  id           String   @id @default(cuid())
+  role         Role     @default(USER)
+
+  email        String?  @unique
+  username     String?  @unique
+
+  passwordHash String
+  fullName     String?
+  isActive     Boolean  @default(true)
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  assignments  StockAssignment[]
+  logs         StockLog[]
+}
+
+model Product {
+  id          String   @id @default(cuid())
+  sku         String?  @unique
+  name        String
+  category    String?
+  unit        String?
+  notes       String?
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  assignments StockAssignment[]
+  logs        StockLog[]
+}
+
+model StockAssignment {
+  id        String   @id @default(cuid())
+  userId    String
+  productId String
+  quantity  Int      @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user      User     @relation(fields: [userId], references: [id])
+  product   Product  @relation(fields: [productId], references: [id])
+
+  @@unique([userId, productId])
+}
+
+enum LogType {
+  SALE
+  RESTOCK
+  DAMAGE
+  EXPENSE
+  ADJUSTMENT
+}
+
+model StockLog {
+  id             String   @id @default(cuid())
+  type           LogType
+  userId         String
+  productId      String?
+
+  quantityChange Int?
+  amountCents    Int?
+  currency       String?
+  note           String?
+
+  createdAt      DateTime @default(now())
+
+  user           User     @relation(fields: [userId], references: [id])
+  product        Product? @relation(fields: [productId], references: [id])
+}
