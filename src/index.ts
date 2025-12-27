@@ -13,7 +13,11 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const PORT = Number(process.env.PORT ?? 4000);
+const PORT = Number(process.env.PORT ?? 8080);
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`✅ Running on port ${PORT}`);
+});
 
 /* -------------------- helpers -------------------- */
 
