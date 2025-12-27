@@ -18,13 +18,27 @@ const PORT = Number(process.env.PORT ?? 4000);
 /* -------------------- helpers -------------------- */
 
 async function ensureTables() {
-  // Creates the users table if it doesn't exist
+  // Needed for gen_random_uuid()
+  await pool.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto;`);
+
+  // Businesses table
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS businesses (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      name TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+
+  // Users table (now includes business_id)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      business_id UUID NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+
       role TEXT NOT NULL CHECK (role IN ('ADMIN','USER')),
-      email TEXT UNIQUE,
-      username TEXT UNIQUE,
+      email TEXT,
+      username TEXT,
       password_hash TEXT NOT NULL,
       full_name TEXT,
       is_active BOOLEAN NOT NULL DEFAULT TRUE,
@@ -32,13 +46,32 @@ async function ensureTables() {
     );
   `);
 
-  // Helpful indexes (safe if run multiple times)
+  // Unique per business (email/username)
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS users_business_email_uq
+    ON users(business_id, email)
+    WHERE email IS NOT NULL;
+  `);
+
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS users_business_username_uq
+    ON users(business_id, username)
+    WHERE username IS NOT NULL;
+  `);
+
+  // Helpful indexes
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS users_business_idx ON users(business_id);
+  `);
   await pool.query(`CREATE INDEX IF NOT EXISTS users_email_idx ON users(email);`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS users_username_idx ON users(username);`);
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS users_username_idx ON users(username);`
+  );
 }
 
 type DbUser = {
   id: string;
+  business_id: string;
   role: "ADMIN" | "USER";
   email: string | null;
   username: string | null;
@@ -50,6 +83,7 @@ type DbUser = {
 function publicUser(u: DbUser) {
   return {
     id: u.id,
+    businessId: u.business_id,
     role: u.role,
     email: u.email,
     username: u.username,
@@ -78,6 +112,7 @@ app.get("/db", async (_req, res) => {
 /**
  * POST /auth/register-admin
  * Body: { email, password, fullName? }
+ * Creates a new Business + an ADMIN in that business
  */
 app.post("/auth/register-admin", async (req, res) => {
   const schema = z.object({
@@ -91,10 +126,18 @@ app.post("/auth/register-admin", async (req, res) => {
 
   const { email, password, fullName } = parsed.data;
 
-  // Check if email already used
+  // Create business first (name = fullName or email prefix)
+  const bizName = fullName?.trim() || email.split("@")[0] || "My Business";
+  const biz = await pool.query<{ id: string }>(
+    `INSERT INTO businesses (name) VALUES ($1) RETURNING id`,
+    [bizName]
+  );
+  const businessId = biz.rows[0].id;
+
+  // Check if email already used in THIS business (usually won't happen, but safe)
   const existing = await pool.query<DbUser>(
-    `SELECT * FROM users WHERE email = $1 LIMIT 1`,
-    [email]
+    `SELECT * FROM users WHERE business_id = $1 AND email = $2 LIMIT 1`,
+    [businessId, email]
   );
   if (existing.rows.length > 0) {
     return res.status(409).json({ error: "Email already in use" });
@@ -103,10 +146,10 @@ app.post("/auth/register-admin", async (req, res) => {
   const passwordHash = await bcrypt.hash(password, 10);
 
   const created = await pool.query<DbUser>(
-    `INSERT INTO users (role, email, password_hash, full_name)
-     VALUES ('ADMIN', $1, $2, $3)
+    `INSERT INTO users (business_id, role, email, password_hash, full_name)
+     VALUES ($1, 'ADMIN', $2, $3, $4)
      RETURNING *`,
-    [email, passwordHash, fullName ?? null]
+    [businessId, email, passwordHash, fullName ?? null]
   );
 
   res.json({ ok: true, admin: publicUser(created.rows[0]) });
@@ -116,6 +159,7 @@ app.post("/auth/register-admin", async (req, res) => {
  * POST /auth/login
  * Admin: { email, password }
  * User:  { username, password }
+ * Returns JWT token with businessId
  */
 app.post("/auth/login", async (req, res) => {
   const schema = z.object({
@@ -130,12 +174,21 @@ app.post("/auth/login", async (req, res) => {
   const { email, username, password } = parsed.data;
 
   if (!email && !username) {
-    return res.status(400).json({ error: "Provide email (admin) or username (user)" });
+    return res
+      .status(400)
+      .json({ error: "Provide email (admin) or username (user)" });
   }
 
+  // ⚠️ With business separation, we need to find the user.
+  // For now: login by global email OR global username is okay,
+  // because the UI uses email for admin and username for user.
+  // If you later allow the same username across businesses, you'll need a business selector.
   const q = email
     ? { text: `SELECT * FROM users WHERE email = $1 LIMIT 1`, values: [email] }
-    : { text: `SELECT * FROM users WHERE username = $1 LIMIT 1`, values: [username] };
+    : {
+        text: `SELECT * FROM users WHERE username = $1 LIMIT 1`,
+        values: [username],
+      };
 
   const result = await pool.query<DbUser>(q.text, q.values);
   const user = result.rows[0];
@@ -145,7 +198,11 @@ app.post("/auth/login", async (req, res) => {
   const ok = await bcrypt.compare(password, user.password_hash);
   if (!ok) return res.status(401).json({ error: "Invalid login" });
 
-  const token = signToken({ userId: user.id, role: user.role });
+  const token = signToken({
+    userId: user.id,
+    role: user.role,
+    businessId: user.business_id,
+  });
 
   res.json({
     ok: true,
@@ -170,7 +227,7 @@ app.get("/me", requireAuth, async (req, res) => {
 
 /**
  * POST /admin/create-user
- * Admin only. Creates a USER with username + password.
+ * Admin only. Creates a USER with username + password inside the SAME business.
  * Body: { username, password, fullName? }
  */
 app.post("/admin/create-user", requireAuth, requireAdmin, async (req, res) => {
@@ -185,9 +242,12 @@ app.post("/admin/create-user", requireAuth, requireAdmin, async (req, res) => {
 
   const { username, password, fullName } = parsed.data;
 
+  const jwtUser = (req as any).user as { businessId: string };
+
+  // Check username inside THIS business only
   const existing = await pool.query<DbUser>(
-    `SELECT * FROM users WHERE username = $1 LIMIT 1`,
-    [username]
+    `SELECT * FROM users WHERE business_id = $1 AND username = $2 LIMIT 1`,
+    [jwtUser.businessId, username]
   );
   if (existing.rows.length > 0) {
     return res.status(409).json({ error: "Username already in use" });
@@ -196,10 +256,10 @@ app.post("/admin/create-user", requireAuth, requireAdmin, async (req, res) => {
   const passwordHash = await bcrypt.hash(password, 10);
 
   const created = await pool.query<DbUser>(
-    `INSERT INTO users (role, username, password_hash, full_name)
-     VALUES ('USER', $1, $2, $3)
+    `INSERT INTO users (business_id, role, username, password_hash, full_name)
+     VALUES ($1, 'USER', $2, $3, $4)
      RETURNING *`,
-    [username, passwordHash, fullName ?? null]
+    [jwtUser.businessId, username, passwordHash, fullName ?? null]
   );
 
   res.json({ ok: true, user: publicUser(created.rows[0]) });
@@ -209,9 +269,6 @@ app.post("/admin/create-user", requireAuth, requireAdmin, async (req, res) => {
 
 async function start() {
   try {
-    // Needed for gen_random_uuid()
-    await pool.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto;`);
-
     await ensureTables();
 
     app.listen(PORT, "0.0.0.0", () => {
