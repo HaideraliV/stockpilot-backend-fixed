@@ -15,8 +15,8 @@ app.use(express.json());
 
 const PORT = Number(process.env.PORT ?? 8080);
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`✅ Running on port ${PORT}`);
+app.get("/", (_req, res) => {
+  res.status(200).send("StockPilot backend is running ✅");
 });
 
 /* -------------------- helpers -------------------- */
