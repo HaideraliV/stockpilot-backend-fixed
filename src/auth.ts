@@ -1,7 +1,11 @@
 import type { Request, Response, NextFunction } from "express";
 import jwt from "jsonwebtoken";
 
-export type JwtUser = { userId: string; role: "ADMIN" | "USER" };
+export type JwtUser = {
+  userId: string;
+  role: "ADMIN" | "USER";
+  businessId: string;
+};
 
 const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-change-me";
 
