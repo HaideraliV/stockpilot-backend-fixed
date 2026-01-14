@@ -43,6 +43,12 @@ type DbUser = {
   is_active: boolean;
 };
 
+type DbBusiness = {
+  id: string;
+  name: string;
+  code3: string;
+};
+
 function publicUser(u: DbUser) {
   return {
     id: u.id,
@@ -55,6 +61,68 @@ function publicUser(u: DbUser) {
   };
 }
 
+function normalizeUsername(u: string) {
+  return u.trim();
+}
+
+function looksLikeBusinessPassword(pw: string) {
+  const t = pw.trim();
+  if (t.length !== 12) return false;
+  if (t[3] !== "-") return false;
+  const code3 = t.substring(0, 3);
+  const secret8 = t.substring(4);
+  if (!/^[A-Z0-9]{3}$/.test(code3)) return false;
+  if (!/^[A-Za-z0-9]{8}$/.test(secret8)) return false;
+  return true;
+}
+
+function extractCode3(pw: string) {
+  return pw.trim().substring(0, 3).toUpperCase();
+}
+
+function generateCode3FromName(name: string) {
+  // Try to get 3 letters from the business name; fallback random
+  const letters = name
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "")
+    .split("");
+  const base = letters.join("");
+  let code = (base + "XXX").substring(0, 3);
+  if (!/^[A-Z0-9]{3}$/.test(code)) code = "SPX";
+  return code;
+}
+
+async function pickUniqueCode3(businessName: string) {
+  // Attempt a few variants to avoid collisions
+  const base = generateCode3FromName(businessName);
+  const variants = [
+    base,
+    base.substring(0, 2) + "1",
+    base.substring(0, 2) + "2",
+    "SP" + Math.floor(Math.random() * 10).toString(),
+  ];
+
+  for (const v of variants) {
+    const code3 = v.toUpperCase();
+    const exists = await pool.query(`SELECT 1 FROM businesses WHERE code3=$1 LIMIT 1`, [code3]);
+    if (exists.rows.length === 0) return code3;
+  }
+
+  // Last resort: random until unique
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  for (let i = 0; i < 200; i++) {
+    const code3 =
+      chars[Math.floor(Math.random() * chars.length)] +
+      chars[Math.floor(Math.random() * chars.length)] +
+      chars[Math.floor(Math.random() * chars.length)];
+    const exists = await pool.query(`SELECT 1 FROM businesses WHERE code3=$1 LIMIT 1`, [code3]);
+    if (exists.rows.length === 0) return code3;
+  }
+
+  // Extremely unlikely fallback
+  return "SPX";
+}
+
 async function ensureTables() {
   await pool.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto;`);
 
@@ -62,6 +130,7 @@ async function ensureTables() {
     CREATE TABLE IF NOT EXISTS businesses (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       name TEXT NOT NULL,
+      code3 TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
@@ -70,6 +139,7 @@ async function ensureTables() {
     CREATE TABLE IF NOT EXISTS users (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       role TEXT NOT NULL CHECK (role IN ('ADMIN','USER')),
+      business_id UUID,
       email TEXT,
       username TEXT,
       password_hash TEXT NOT NULL,
@@ -79,7 +149,7 @@ async function ensureTables() {
     );
   `);
 
-  // Ensure business_id exists
+  // Ensure business_id exists + required + FK
   const colCheck = await pool.query<{ exists: boolean }>(`
     SELECT EXISTS (
       SELECT 1
@@ -93,28 +163,54 @@ async function ensureTables() {
     await pool.query(`ALTER TABLE users ADD COLUMN business_id UUID;`);
   }
 
-  // Ensure a default business exists (for old rows)
+  // Ensure a default business exists
   await pool.query(`
     INSERT INTO businesses (name)
     VALUES ('Default Business')
     ON CONFLICT DO NOTHING;
   `);
 
+  // Ensure code3 exists on businesses
+  const bizCodeCheck = await pool.query<{ exists: boolean }>(`
+    SELECT EXISTS (
+      SELECT 1
+      FROM information_schema.columns
+      WHERE table_name = 'businesses'
+        AND column_name = 'code3'
+    ) AS exists;
+  `);
+  if (!bizCodeCheck.rows[0].exists) {
+    await pool.query(`ALTER TABLE businesses ADD COLUMN code3 TEXT;`);
+  }
+
+  // Backfill code3 for businesses where missing
+  const missingCodes = await pool.query<DbBusiness>(`SELECT id, name, COALESCE(code3,'') AS code3 FROM businesses`);
+  for (const b of missingCodes.rows) {
+    if (!b.code3 || b.code3.trim().length !== 3) {
+      const code3 = await pickUniqueCode3(b.name);
+      await pool.query(`UPDATE businesses SET code3=$1 WHERE id=$2`, [code3, b.id]);
+    }
+  }
+
+  // Make code3 unique + required
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS businesses_code3_uq
+    ON businesses(code3)
+    WHERE code3 IS NOT NULL;
+  `);
+
+  await pool.query(`UPDATE businesses SET code3='SPX' WHERE code3 IS NULL OR code3=''`);
+  await pool.query(`ALTER TABLE businesses ALTER COLUMN code3 SET NOT NULL;`);
+
+  // Backfill existing users.business_id
   const defaultBiz = await pool.query<{ id: string }>(
     `SELECT id FROM businesses WHERE name = 'Default Business' LIMIT 1`
   );
   const defaultBusinessId = defaultBiz.rows[0].id;
+  await pool.query(`UPDATE users SET business_id = $1 WHERE business_id IS NULL`, [defaultBusinessId]);
 
-  // Backfill existing users
-  await pool.query(
-    `UPDATE users SET business_id = $1 WHERE business_id IS NULL`,
-    [defaultBusinessId]
-  );
-
-  // Make business_id required
   await pool.query(`ALTER TABLE users ALTER COLUMN business_id SET NOT NULL;`);
 
-  // FK constraint (only if missing)
   await pool.query(`
     DO $$
     BEGIN
@@ -142,7 +238,7 @@ async function ensureTables() {
     WHERE username IS NOT NULL;
   `);
 
-  // ✅ CRITICAL RULE: Admin email must be unique globally (across ALL businesses)
+  // Admin email unique globally
   await pool.query(`
     CREATE UNIQUE INDEX IF NOT EXISTS admins_email_global_uq
     ON users(email)
@@ -159,7 +255,6 @@ async function ensureTables() {
 /**
  * POST /auth/admin/register
  * Body: { businessName, email, password }
- * Creates a BUSINESS + an ADMIN tied to that business.
  */
 app.post("/auth/admin/register", async (req, res) => {
   const schema = z.object({
@@ -176,7 +271,7 @@ app.post("/auth/admin/register", async (req, res) => {
   const { businessName, email, password } = parsed.data;
 
   try {
-    // ✅ If admin email already exists anywhere, block it
+    // block existing admin email
     const existingAdmin = await pool.query(
       `SELECT 1 FROM users WHERE role='ADMIN' AND email=$1 LIMIT 1`,
       [email]
@@ -185,14 +280,14 @@ app.post("/auth/admin/register", async (req, res) => {
       return res.status(409).json({ message: "Email already in use" });
     }
 
-    // Create business
-    const biz = await pool.query<{ id: string }>(
-      `INSERT INTO businesses (name) VALUES ($1) RETURNING id`,
-      [businessName]
+    const code3 = await pickUniqueCode3(businessName);
+
+    const biz = await pool.query<{ id: string; code3: string }>(
+      `INSERT INTO businesses (name, code3) VALUES ($1, $2) RETURNING id, code3`,
+      [businessName, code3]
     );
     const businessId = biz.rows[0].id;
 
-    // Create admin user
     const passwordHash = await bcrypt.hash(password, 10);
 
     const created = await pool.query<DbUser>(
@@ -212,11 +307,11 @@ app.post("/auth/admin/register", async (req, res) => {
       ok: true,
       message: "Admin created",
       token,
+      businessCode3: biz.rows[0].code3,
       user: publicUser(created.rows[0]),
     });
   } catch (e: any) {
     const msg = e?.message ?? "Register failed";
-    // Postgres unique violation usually contains "duplicate key value"
     if (msg.toLowerCase().includes("duplicate")) {
       return res.status(409).json({ message: "Email already in use" });
     }
@@ -227,7 +322,7 @@ app.post("/auth/admin/register", async (req, res) => {
 /**
  * POST /auth/login
  * Admin: { role:"admin", email, password }
- * User:  { role:"user", username, password }
+ * User:  { role:"user", username, password } where password MUST be ABC-xxxxxxxx
  */
 app.post("/auth/login", async (req, res) => {
   const schema = z.object({
@@ -245,17 +340,62 @@ app.post("/auth/login", async (req, res) => {
   const { role, email, username, password } = parsed.data;
 
   try {
-    const q =
-      role === "admin"
-        ? { text: `SELECT * FROM users WHERE role='ADMIN' AND email=$1 LIMIT 1`, values: [email ?? ""] }
-        : { text: `SELECT * FROM users WHERE role='USER' AND username=$1 LIMIT 1`, values: [username ?? ""] };
+    if (role === "admin") {
+      const result = await pool.query<DbUser>(
+        `SELECT * FROM users WHERE role='ADMIN' AND email=$1 LIMIT 1`,
+        [(email ?? "").trim().toLowerCase()]
+      );
+      const user = result.rows[0];
 
-    const result = await pool.query<DbUser>(q.text, q.values);
-    const user = result.rows[0];
+      if (!user || !user.is_active) return res.status(401).json({ message: "Invalid login" });
 
-    if (!user || !user.is_active) {
+      const ok = await bcrypt.compare(password, user.password_hash);
+      if (!ok) return res.status(401).json({ message: "Invalid login" });
+
+      const token = signToken({
+        userId: user.id,
+        role: user.role,
+        businessId: user.business_id,
+      });
+
+      const biz = await pool.query<DbBusiness>(
+        `SELECT id, name, code3 FROM businesses WHERE id=$1 LIMIT 1`,
+        [user.business_id]
+      );
+
+      return res.json({
+        ok: true,
+        token,
+        businessCode3: biz.rows[0]?.code3 ?? null,
+        user: publicUser(user),
+      });
+    }
+
+    // USER login
+    const uname = normalizeUsername(username ?? "");
+    if (!uname) return res.status(400).json({ message: "Invalid input" });
+
+    if (!looksLikeBusinessPassword(password)) {
       return res.status(401).json({ message: "Invalid login" });
     }
+
+    const code3 = extractCode3(password);
+
+    const biz = await pool.query<DbBusiness>(
+      `SELECT id, name, code3 FROM businesses WHERE code3=$1 LIMIT 1`,
+      [code3]
+    );
+    if (biz.rows.length === 0) return res.status(401).json({ message: "Invalid login" });
+
+    const businessId = biz.rows[0].id;
+
+    const result = await pool.query<DbUser>(
+      `SELECT * FROM users WHERE role='USER' AND business_id=$1 AND username=$2 LIMIT 1`,
+      [businessId, uname]
+    );
+    const user = result.rows[0];
+
+    if (!user || !user.is_active) return res.status(401).json({ message: "Invalid login" });
 
     const ok = await bcrypt.compare(password, user.password_hash);
     if (!ok) return res.status(401).json({ message: "Invalid login" });
@@ -266,7 +406,12 @@ app.post("/auth/login", async (req, res) => {
       businessId: user.business_id,
     });
 
-    return res.json({ ok: true, token, user: publicUser(user) });
+    return res.json({
+      ok: true,
+      token,
+      businessCode3: biz.rows[0].code3,
+      user: publicUser(user),
+    });
   } catch (e: any) {
     return res.status(500).json({ message: e?.message ?? "Login failed" });
   }
@@ -283,7 +428,6 @@ app.get("/me", requireAuth, async (req, res) => {
   );
   const user = result.rows[0];
 
-  // ✅ If account was deleted, token becomes useless
   if (!user || !user.is_active) {
     return res.status(401).json({ message: "Account no longer exists" });
   }
@@ -292,11 +436,12 @@ app.get("/me", requireAuth, async (req, res) => {
 });
 
 /**
- * POST /admin/create-user
+ * POST /admin/users
  * Admin only.
  * Body: { username, password, fullName? }
+ * password MUST be ABC-xxxxxxxx (12 chars)
  */
-app.post("/admin/create-user", requireAuth, requireAdmin, async (req, res) => {
+app.post("/admin/users", requireAuth, requireAdmin, async (req, res) => {
   const schema = z.object({
     username: z.string().min(2),
     password: z.string().min(8),
@@ -311,10 +456,29 @@ app.post("/admin/create-user", requireAuth, requireAdmin, async (req, res) => {
   const { username, password, fullName } = parsed.data;
   const jwt = (req as any).user as { businessId: string };
 
+  const uname = normalizeUsername(username);
+
+  // enforce your format
+  if (!looksLikeBusinessPassword(password)) {
+    return res.status(400).json({ message: "Password must look like ABC-1234XyZ9" });
+  }
+
+  // ensure password code3 matches this business
+  const biz = await pool.query<DbBusiness>(
+    `SELECT id, code3 FROM businesses WHERE id=$1 LIMIT 1`,
+    [jwt.businessId]
+  );
+  const businessCode3 = biz.rows[0]?.code3 ?? null;
+  if (!businessCode3) return res.status(500).json({ message: "Business missing code3" });
+
+  if (extractCode3(password) !== businessCode3) {
+    return res.status(400).json({ message: `Password must start with ${businessCode3}-` });
+  }
+
   try {
     const existing = await pool.query(
       `SELECT 1 FROM users WHERE business_id = $1 AND username = $2 LIMIT 1`,
-      [jwt.businessId, username]
+      [jwt.businessId, uname]
     );
     if (existing.rows.length > 0) {
       return res.status(409).json({ message: "Username already in use" });
@@ -326,26 +490,56 @@ app.post("/admin/create-user", requireAuth, requireAdmin, async (req, res) => {
       `INSERT INTO users (role, business_id, username, password_hash, full_name)
        VALUES ('USER', $1, $2, $3, $4)
        RETURNING *`,
-      [jwt.businessId, username, passwordHash, fullName ?? null]
+      [jwt.businessId, uname, passwordHash, fullName ?? null]
     );
 
-    return res.json({ ok: true, user: publicUser(created.rows[0]) });
+    return res.json({
+      ok: true,
+      message: "User created",
+      businessCode3,
+      user: publicUser(created.rows[0]),
+    });
   } catch (e: any) {
     return res.status(500).json({ message: e?.message ?? "Create user failed" });
   }
 });
 
 /**
- * ✅ DELETE /admin/delete-account
- * Admin only.
- * Deletes the BUSINESS row → cascades and deletes ALL users of that business.
- * After this, login with same email WILL FAIL.
+ * DELETE /admin/users/:username
+ * Admin only. Permanently deletes that user from DB.
+ */
+app.delete("/admin/users/:username", requireAuth, requireAdmin, async (req, res) => {
+  const jwt = (req as any).user as { businessId: string };
+  const username = normalizeUsername(req.params.username ?? "");
+
+  if (!username) return res.status(400).json({ message: "Invalid input" });
+
+  try {
+    const del = await pool.query(
+      `DELETE FROM users
+       WHERE role='USER' AND business_id=$1 AND username=$2
+       RETURNING id`,
+      [jwt.businessId, username]
+    );
+
+    if (del.rows.length === 0) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    return res.json({ ok: true, message: "User deleted" });
+  } catch (e: any) {
+    return res.status(500).json({ message: e?.message ?? "Delete user failed" });
+  }
+});
+
+/**
+ * DELETE /admin/delete-account
+ * Admin only. Deletes BUSINESS -> cascades and deletes ALL users.
  */
 app.delete("/admin/delete-account", requireAuth, requireAdmin, async (req, res) => {
   const jwt = (req as any).user as { businessId: string; userId: string };
 
   try {
-    // Extra safety: ensure the requesting admin still exists
     const admin = await pool.query(
       `SELECT 1 FROM users WHERE id=$1 AND role='ADMIN' AND business_id=$2 LIMIT 1`,
       [jwt.userId, jwt.businessId]
@@ -354,7 +548,6 @@ app.delete("/admin/delete-account", requireAuth, requireAdmin, async (req, res) 
       return res.status(401).json({ message: "Account no longer exists" });
     }
 
-    // Delete business -> cascades users
     await pool.query(`DELETE FROM businesses WHERE id=$1`, [jwt.businessId]);
 
     return res.json({ ok: true, message: "Account deleted" });
