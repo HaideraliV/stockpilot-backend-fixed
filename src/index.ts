@@ -80,11 +80,8 @@ function extractCode3(pw: string) {
   return pw.trim().substring(0, 3).toUpperCase();
 }
 
-function extractSecret8(pw: string) {
-  return pw.trim().substring(4);
-}
-
 function generateCode3FromName(name: string) {
+  // Try to get 3 letters from the business name; fallback random
   const letters = name
     .toUpperCase()
     .replace(/[^A-Z0-9]/g, "")
@@ -96,6 +93,7 @@ function generateCode3FromName(name: string) {
 }
 
 async function pickUniqueCode3(businessName: string) {
+  // Attempt a few variants to avoid collisions
   const base = generateCode3FromName(businessName);
   const variants = [
     base,
@@ -106,20 +104,28 @@ async function pickUniqueCode3(businessName: string) {
 
   for (const v of variants) {
     const code3 = v.toUpperCase();
-    const exists = await pool.query(`SELECT 1 FROM businesses WHERE code3=$1 LIMIT 1`, [code3]);
+    const exists = await pool.query(
+      `SELECT 1 FROM businesses WHERE code3=$1 LIMIT 1`,
+      [code3]
+    );
     if (exists.rows.length === 0) return code3;
   }
 
+  // Last resort: random until unique
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   for (let i = 0; i < 200; i++) {
     const code3 =
       chars[Math.floor(Math.random() * chars.length)] +
       chars[Math.floor(Math.random() * chars.length)] +
       chars[Math.floor(Math.random() * chars.length)];
-    const exists = await pool.query(`SELECT 1 FROM businesses WHERE code3=$1 LIMIT 1`, [code3]);
+    const exists = await pool.query(
+      `SELECT 1 FROM businesses WHERE code3=$1 LIMIT 1`,
+      [code3]
+    );
     if (exists.rows.length === 0) return code3;
   }
 
+  // Extremely unlikely fallback
   return "SPX";
 }
 
@@ -149,7 +155,7 @@ async function ensureTables() {
     );
   `);
 
-  // Ensure business_id exists
+  // Ensure business_id exists + required + FK
   const colCheck = await pool.query<{ exists: boolean }>(`
     SELECT EXISTS (
       SELECT 1
@@ -163,14 +169,14 @@ async function ensureTables() {
     await pool.query(`ALTER TABLE users ADD COLUMN business_id UUID;`);
   }
 
-  // Ensure default business exists
+  // Ensure a default business exists
   await pool.query(`
     INSERT INTO businesses (name)
     VALUES ('Default Business')
     ON CONFLICT DO NOTHING;
   `);
 
-  // Ensure code3 exists
+  // Ensure code3 exists on businesses
   const bizCodeCheck = await pool.query<{ exists: boolean }>(`
     SELECT EXISTS (
       SELECT 1
@@ -183,32 +189,41 @@ async function ensureTables() {
     await pool.query(`ALTER TABLE businesses ADD COLUMN code3 TEXT;`);
   }
 
-  // Backfill code3
+  // Backfill code3 for businesses where missing
   const missingCodes = await pool.query<DbBusiness>(
     `SELECT id, name, COALESCE(code3,'') AS code3 FROM businesses`
   );
   for (const b of missingCodes.rows) {
     if (!b.code3 || b.code3.trim().length !== 3) {
       const code3 = await pickUniqueCode3(b.name);
-      await pool.query(`UPDATE businesses SET code3=$1 WHERE id=$2`, [code3, b.id]);
+      await pool.query(`UPDATE businesses SET code3=$1 WHERE id=$2`, [
+        code3,
+        b.id,
+      ]);
     }
   }
 
+  // Make code3 unique + required
   await pool.query(`
     CREATE UNIQUE INDEX IF NOT EXISTS businesses_code3_uq
     ON businesses(code3)
     WHERE code3 IS NOT NULL;
   `);
 
-  await pool.query(`UPDATE businesses SET code3='SPX' WHERE code3 IS NULL OR code3=''`);
+  await pool.query(
+    `UPDATE businesses SET code3='SPX' WHERE code3 IS NULL OR code3=''`
+  );
   await pool.query(`ALTER TABLE businesses ALTER COLUMN code3 SET NOT NULL;`);
 
-  // Backfill users.business_id
+  // Backfill existing users.business_id
   const defaultBiz = await pool.query<{ id: string }>(
     `SELECT id FROM businesses WHERE name = 'Default Business' LIMIT 1`
   );
   const defaultBusinessId = defaultBiz.rows[0].id;
-  await pool.query(`UPDATE users SET business_id = $1 WHERE business_id IS NULL`, [defaultBusinessId]);
+  await pool.query(
+    `UPDATE users SET business_id = $1 WHERE business_id IS NULL`,
+    [defaultBusinessId]
+  );
 
   await pool.query(`ALTER TABLE users ALTER COLUMN business_id SET NOT NULL;`);
 
@@ -226,6 +241,7 @@ async function ensureTables() {
     END $$;
   `);
 
+  // Unique per business
   await pool.query(`
     CREATE UNIQUE INDEX IF NOT EXISTS users_business_email_uq
     ON users(business_id, email)
@@ -238,6 +254,7 @@ async function ensureTables() {
     WHERE username IS NOT NULL;
   `);
 
+  // Admin email unique globally
   await pool.query(`
     CREATE UNIQUE INDEX IF NOT EXISTS admins_email_global_uq
     ON users(email)
@@ -266,6 +283,7 @@ app.post("/auth/admin/register", async (req, res) => {
   const { businessName, email, password } = parsed.data;
 
   try {
+    // block existing admin email
     const existingAdmin = await pool.query(
       `SELECT 1 FROM users WHERE role='ADMIN' AND email=$1 LIMIT 1`,
       [email]
@@ -360,7 +378,7 @@ app.post("/auth/login", async (req, res) => {
       });
     }
 
-    // USER login (expects ABC-xxxxxxxx)
+    // USER login
     const uname = normalizeUsername(username ?? "");
     if (!uname) return res.status(400).json({ message: "Invalid input" });
 
@@ -386,7 +404,6 @@ app.post("/auth/login", async (req, res) => {
 
     if (!user || !user.is_active) return res.status(401).json({ message: "Invalid login" });
 
-    // Compare full 12-char (current behavior)
     const ok = await bcrypt.compare(password, user.password_hash);
     if (!ok) return res.status(401).json({ message: "Invalid login" });
 
@@ -425,9 +442,8 @@ app.get("/me", requireAuth, async (req, res) => {
 });
 
 /**
- * ✅ FIX for your 404:
- * GET /admin/users
- * Admin only. Returns all USER accounts for this business.
+ * ✅ THIS IS THE ONLY FIX NEEDED FOR YOUR 404:
+ * GET /admin/users (Admin only)
  */
 app.get("/admin/users", requireAuth, requireAdmin, async (req, res) => {
   const jwt = (req as any).user as { businessId: string };
@@ -472,13 +488,16 @@ app.post("/admin/users", requireAuth, requireAdmin, async (req, res) => {
 
   const uname = normalizeUsername(username);
 
+  // enforce your format
   if (!looksLikeBusinessPassword(password)) {
     return res.status(400).json({ message: "Password must look like ABC-1234XyZ9" });
   }
 
-  const biz = await pool.query<DbBusiness>(`SELECT id, code3 FROM businesses WHERE id=$1 LIMIT 1`, [
-    jwt.businessId,
-  ]);
+  // ensure password code3 matches this business
+  const biz = await pool.query<DbBusiness>(
+    `SELECT id, code3 FROM businesses WHERE id=$1 LIMIT 1`,
+    [jwt.businessId]
+  );
   const businessCode3 = biz.rows[0]?.code3 ?? null;
   if (!businessCode3) return res.status(500).json({ message: "Business missing code3" });
 
@@ -487,15 +506,14 @@ app.post("/admin/users", requireAuth, requireAdmin, async (req, res) => {
   }
 
   try {
-    const existing = await pool.query(`SELECT 1 FROM users WHERE business_id = $1 AND username = $2 LIMIT 1`, [
-      jwt.businessId,
-      uname,
-    ]);
+    const existing = await pool.query(
+      `SELECT 1 FROM users WHERE business_id = $1 AND username = $2 LIMIT 1`,
+      [jwt.businessId, uname]
+    );
     if (existing.rows.length > 0) {
       return res.status(409).json({ message: "Username already in use" });
     }
 
-    // Keep your current behavior: store hash of the full 12-char password
     const passwordHash = await bcrypt.hash(password, 10);
 
     const created = await pool.query<DbUser>(
