@@ -81,7 +81,6 @@ function extractCode3(pw: string) {
 }
 
 function generateCode3FromName(name: string) {
-  // Try to get 3 letters from the business name; fallback random
   const letters = name
     .toUpperCase()
     .replace(/[^A-Z0-9]/g, "")
@@ -93,7 +92,6 @@ function generateCode3FromName(name: string) {
 }
 
 async function pickUniqueCode3(businessName: string) {
-  // Attempt a few variants to avoid collisions
   const base = generateCode3FromName(businessName);
   const variants = [
     base,
@@ -111,7 +109,6 @@ async function pickUniqueCode3(businessName: string) {
     if (exists.rows.length === 0) return code3;
   }
 
-  // Last resort: random until unique
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   for (let i = 0; i < 200; i++) {
     const code3 =
@@ -125,18 +122,18 @@ async function pickUniqueCode3(businessName: string) {
     if (exists.rows.length === 0) return code3;
   }
 
-  // Extremely unlikely fallback
   return "SPX";
 }
 
 async function ensureTables() {
   await pool.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto;`);
 
+  // ✅ Create businesses with a DEFAULT code3 so inserts never crash
   await pool.query(`
     CREATE TABLE IF NOT EXISTS businesses (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       name TEXT NOT NULL,
-      code3 TEXT,
+      code3 TEXT DEFAULT 'SPX',
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
@@ -155,7 +152,7 @@ async function ensureTables() {
     );
   `);
 
-  // Ensure business_id exists + required + FK
+  // Ensure business_id exists
   const colCheck = await pool.query<{ exists: boolean }>(`
     SELECT EXISTS (
       SELECT 1
@@ -169,14 +166,7 @@ async function ensureTables() {
     await pool.query(`ALTER TABLE users ADD COLUMN business_id UUID;`);
   }
 
-  // Ensure a default business exists
-  await pool.query(`
-    INSERT INTO businesses (name)
-    VALUES ('Default Business')
-    ON CONFLICT DO NOTHING;
-  `);
-
-  // Ensure code3 exists on businesses
+  // Ensure code3 exists on businesses (older DBs)
   const bizCodeCheck = await pool.query<{ exists: boolean }>(`
     SELECT EXISTS (
       SELECT 1
@@ -185,21 +175,34 @@ async function ensureTables() {
         AND column_name = 'code3'
     ) AS exists;
   `);
+
   if (!bizCodeCheck.rows[0].exists) {
-    await pool.query(`ALTER TABLE businesses ADD COLUMN code3 TEXT;`);
+    await pool.query(`ALTER TABLE businesses ADD COLUMN code3 TEXT DEFAULT 'SPX';`);
   }
 
-  // Backfill code3 for businesses where missing
-  const missingCodes = await pool.query<DbBusiness>(
-    `SELECT id, name, COALESCE(code3,'') AS code3 FROM businesses`
+  // ✅ Ensure default exists for code3 (safe even if already set)
+  await pool.query(`ALTER TABLE businesses ALTER COLUMN code3 SET DEFAULT 'SPX';`);
+
+  // ✅ Insert Default Business SAFELY WITH code3 (no NOT NULL crash)
+  await pool.query(`
+    INSERT INTO businesses (name, code3)
+    SELECT 'Default Business', 'SPX'
+    WHERE NOT EXISTS (SELECT 1 FROM businesses WHERE name='Default Business');
+  `);
+
+  // ✅ Backfill ANY NULL/empty code3 BEFORE enforcing NOT NULL
+  await pool.query(`UPDATE businesses SET code3='SPX' WHERE code3 IS NULL OR code3=''`);
+
+  // Backfill code3 properly for businesses that have invalid length
+  const allBiz = await pool.query<DbBusiness>(
+    `SELECT id, name, code3 FROM businesses`
   );
-  for (const b of missingCodes.rows) {
-    if (!b.code3 || b.code3.trim().length !== 3) {
+
+  for (const b of allBiz.rows) {
+    const c = (b.code3 ?? "").trim().toUpperCase();
+    if (!/^[A-Z0-9]{3}$/.test(c)) {
       const code3 = await pickUniqueCode3(b.name);
-      await pool.query(`UPDATE businesses SET code3=$1 WHERE id=$2`, [
-        code3,
-        b.id,
-      ]);
+      await pool.query(`UPDATE businesses SET code3=$1 WHERE id=$2`, [code3, b.id]);
     }
   }
 
@@ -210,9 +213,7 @@ async function ensureTables() {
     WHERE code3 IS NOT NULL;
   `);
 
-  await pool.query(
-    `UPDATE businesses SET code3='SPX' WHERE code3 IS NULL OR code3=''`
-  );
+  // ✅ Now enforce NOT NULL (safe because we already backfilled)
   await pool.query(`ALTER TABLE businesses ALTER COLUMN code3 SET NOT NULL;`);
 
   // Backfill existing users.business_id
@@ -220,6 +221,7 @@ async function ensureTables() {
     `SELECT id FROM businesses WHERE name = 'Default Business' LIMIT 1`
   );
   const defaultBusinessId = defaultBiz.rows[0].id;
+
   await pool.query(
     `UPDATE users SET business_id = $1 WHERE business_id IS NULL`,
     [defaultBusinessId]
@@ -283,7 +285,6 @@ app.post("/auth/admin/register", async (req, res) => {
   const { businessName, email, password } = parsed.data;
 
   try {
-    // block existing admin email
     const existingAdmin = await pool.query(
       `SELECT 1 FROM users WHERE role='ADMIN' AND email=$1 LIMIT 1`,
       [email]
@@ -378,7 +379,6 @@ app.post("/auth/login", async (req, res) => {
       });
     }
 
-    // USER login
     const uname = normalizeUsername(username ?? "");
     if (!uname) return res.status(400).json({ message: "Invalid input" });
 
@@ -429,9 +429,10 @@ app.post("/auth/login", async (req, res) => {
 app.get("/me", requireAuth, async (req, res) => {
   const jwtUser = (req as any).user as { userId: string };
 
-  const result = await pool.query<DbUser>(`SELECT * FROM users WHERE id = $1 LIMIT 1`, [
-    jwtUser.userId,
-  ]);
+  const result = await pool.query<DbUser>(
+    `SELECT * FROM users WHERE id = $1 LIMIT 1`,
+    [jwtUser.userId]
+  );
   const user = result.rows[0];
 
   if (!user || !user.is_active) {
@@ -442,7 +443,7 @@ app.get("/me", requireAuth, async (req, res) => {
 });
 
 /**
- * ✅ THIS IS THE ONLY FIX NEEDED FOR YOUR 404:
+ * ✅ FIX FOR YOUR 404 AFTER "User created":
  * GET /admin/users (Admin only)
  */
 app.get("/admin/users", requireAuth, requireAdmin, async (req, res) => {
@@ -468,8 +469,6 @@ app.get("/admin/users", requireAuth, requireAdmin, async (req, res) => {
 /**
  * POST /admin/users
  * Admin only.
- * Body: { username, password, fullName? }
- * password MUST be ABC-xxxxxxxx (12 chars)
  */
 app.post("/admin/users", requireAuth, requireAdmin, async (req, res) => {
   const schema = z.object({
@@ -488,12 +487,10 @@ app.post("/admin/users", requireAuth, requireAdmin, async (req, res) => {
 
   const uname = normalizeUsername(username);
 
-  // enforce your format
   if (!looksLikeBusinessPassword(password)) {
     return res.status(400).json({ message: "Password must look like ABC-1234XyZ9" });
   }
 
-  // ensure password code3 matches this business
   const biz = await pool.query<DbBusiness>(
     `SELECT id, code3 FROM businesses WHERE id=$1 LIMIT 1`,
     [jwt.businessId]
