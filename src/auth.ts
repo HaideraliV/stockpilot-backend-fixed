@@ -5,6 +5,8 @@ export type JwtUser = {
   userId: string;
   role: "ADMIN" | "USER";
   businessId: string;
+  adminId?: string;
+  username?: string;
 };
 
 const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-change-me";
