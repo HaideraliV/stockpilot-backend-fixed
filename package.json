@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
-    "start": "tsx src/index.ts"
+    "start": "tsx src/index.ts",
+    "purge:test-admins": "tsx scripts/purge_test_admins.ts"
   },
   "keywords": [],
   "author": "",
