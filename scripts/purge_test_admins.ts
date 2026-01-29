@@ -72,7 +72,7 @@ async function purgeAdminByEmail(email: string) {
           `DELETE FROM "${t.table_name}" WHERE business_id=$1 RETURNING 1`,
           [admin.business_id]
         );
-        counts[t.table_name] = (counts[t.table_name] ?? 0) + del.rowCount;
+        counts[t.table_name] = (counts[t.table_name] ?? 0) + (del.rowCount ?? 0);
         continue;
       }
 
@@ -85,7 +85,7 @@ async function purgeAdminByEmail(email: string) {
           `,
           [admin.business_id]
         );
-        counts[t.table_name] = (counts[t.table_name] ?? 0) + del.rowCount;
+        counts[t.table_name] = (counts[t.table_name] ?? 0) + (del.rowCount ?? 0);
       }
     }
 
@@ -93,19 +93,19 @@ async function purgeAdminByEmail(email: string) {
       `DELETE FROM password_resets WHERE user_id IN (SELECT id FROM users WHERE business_id=$1) RETURNING 1`,
       [admin.business_id]
     );
-    counts.password_resets = resets.rowCount;
+    counts.password_resets = resets.rowCount ?? 0;
 
     const users = await client.query(
       `DELETE FROM users WHERE business_id=$1 RETURNING 1`,
       [admin.business_id]
     );
-    counts.users = users.rowCount;
+    counts.users = users.rowCount ?? 0;
 
     const biz = await client.query(
       `DELETE FROM businesses WHERE id=$1 RETURNING 1`,
       [admin.business_id]
     );
-    counts.businesses = biz.rowCount;
+    counts.businesses = biz.rowCount ?? 0;
 
     await client.query("COMMIT");
 

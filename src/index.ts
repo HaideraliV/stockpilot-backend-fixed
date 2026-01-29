@@ -64,6 +64,10 @@ async function ensureTables() {
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMPTZ;`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS reviewed_by TEXT;`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS tz_offset_minutes INT;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS currency_code TEXT;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS currency_symbol TEXT;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ;`);
 
   // Backfill status for existing rows
   await pool.query(
@@ -79,9 +83,13 @@ async function ensureTables() {
     `UPDATE users SET updated_at=now() WHERE updated_at IS NULL`
   );
   await pool.query(
+    `UPDATE users SET tz_offset_minutes=0 WHERE tz_offset_minutes IS NULL`
+  );
+  await pool.query(
     `ALTER TABLE users ALTER COLUMN status SET DEFAULT 'PENDING'`
   );
   await pool.query(`ALTER TABLE users ALTER COLUMN status SET NOT NULL`);
+  await pool.query(`ALTER TABLE users ALTER COLUMN tz_offset_minutes SET DEFAULT 0`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS password_resets (
@@ -121,6 +129,78 @@ async function ensureTables() {
      ON users(business_id, email)
      WHERE business_id IS NOT NULL AND email IS NOT NULL;`
   );
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_activity (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      business_id UUID NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      type TEXT NOT NULL,
+      title TEXT NOT NULL,
+      details TEXT NOT NULL,
+      at TIMESTAMPTZ NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS user_activity_user_idx ON user_activity(user_id);`
+  );
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS user_activity_at_idx ON user_activity(at);`
+  );
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_expenses (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      business_id UUID NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      day_key TEXT NOT NULL,
+      data JSONB NOT NULL DEFAULT '{}'::jsonb,
+      saved_at TIMESTAMPTZ NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  await pool.query(
+    `CREATE UNIQUE INDEX IF NOT EXISTS user_expenses_user_day_key
+     ON user_expenses(user_id, day_key);`
+  );
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_report_state (
+      user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      last_sent_day TEXT,
+      last_sent_at TIMESTAMPTZ
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS admin_reports (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      business_id UUID NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+      admin_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      username TEXT NOT NULL,
+      currency_symbol TEXT NOT NULL,
+      currency_code TEXT NOT NULL,
+      sent_at TIMESTAMPTZ NOT NULL,
+      stock_ins JSONB NOT NULL DEFAULT '[]'::jsonb,
+      stock_outs JSONB NOT NULL DEFAULT '[]'::jsonb,
+      expenses JSONB NOT NULL DEFAULT '[]'::jsonb,
+      total_stock_out NUMERIC NOT NULL DEFAULT 0,
+      total_expenses NUMERIC NOT NULL DEFAULT 0,
+      final_total NUMERIC NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS admin_reports_admin_idx ON admin_reports(admin_id);`
+  );
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS admin_reports_business_idx ON admin_reports(business_id);`
+  );
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS admin_reports_sent_at_idx ON admin_reports(sent_at);`
+  );
 }
 
 type DbUser = {
@@ -139,6 +219,10 @@ type DbUser = {
   reviewed_at?: string | null;
   reviewed_by?: string | null;
   updated_at?: string | null;
+  tz_offset_minutes?: number | null;
+  currency_code?: string | null;
+  currency_symbol?: string | null;
+  last_seen_at?: string | null;
 };
 
 function publicUser(u: DbUser) {
@@ -165,7 +249,112 @@ function adminSummaryRow(row: any) {
     createdAt: row.created_at,
     reviewedAt: row.reviewed_at,
     statusReason: row.status_reason ?? null,
+    reportCount: Number(row.report_count ?? 0),
   };
+}
+
+function headAdminSearchRow(row: any) {
+  return {
+    adminId: row.id,
+    email: row.email,
+    role: row.role,
+    status: row.status,
+    desiredUserLimit: row.desired_user_limit,
+    approvedUserLimit: row.approved_user_limit,
+    businessName: row.business_name ?? null,
+    businessCode3: row.code3 ?? null,
+    createdAt: row.created_at,
+  };
+}
+
+function adminReportRow(row: any) {
+  return {
+    reportId: row.id,
+    username: row.username,
+    sentAt: row.sent_at,
+    currencySymbol: row.currency_symbol,
+    currencyCode: row.currency_code,
+    stockIns: row.stock_ins ?? [],
+    stockOuts: row.stock_outs ?? [],
+    expenses: row.expenses ?? [],
+    totalStockOut: Number(row.total_stock_out ?? 0),
+    totalExpenses: Number(row.total_expenses ?? 0),
+    finalTotal: Number(row.final_total ?? 0),
+  };
+}
+
+function clampTzOffsetMinutes(v: number) {
+  if (Number.isNaN(v)) return 0;
+  if (v > 840) return 840;
+  if (v < -840) return -840;
+  return Math.trunc(v);
+}
+
+function localDatePartsFromOffset(now: Date, offsetMinutes: number) {
+  const ms = now.getTime() + offsetMinutes * 60 * 1000;
+  const d = new Date(ms);
+  return {
+    y: d.getUTCFullYear(),
+    m: d.getUTCMonth() + 1,
+    day: d.getUTCDate(),
+    hh: d.getUTCHours(),
+    mm: d.getUTCMinutes(),
+  };
+}
+
+function dayKeyFromOffsetDate(d: Date, offsetMinutes: number) {
+  const p = localDatePartsFromOffset(d, offsetMinutes);
+  const mm = String(p.m).padStart(2, "0");
+  const dd = String(p.day).padStart(2, "0");
+  return `${p.y}-${mm}-${dd}`;
+}
+
+function utcRangeForLocalDay(dayKey: string, offsetMinutes: number) {
+  const [y, m, d] = dayKey.split("-").map((v) => Number(v));
+  const startLocalUtcMs = Date.UTC(y, (m ?? 1) - 1, d ?? 1, 0, 0, 0, 0);
+  const startUtcMs = startLocalUtcMs - offsetMinutes * 60 * 1000;
+  const endUtcMs = startUtcMs + 24 * 60 * 60 * 1000;
+  return {
+    startUtc: new Date(startUtcMs).toISOString(),
+    endUtc: new Date(endUtcMs).toISOString(),
+  };
+}
+
+function parseSoldPrice(details: string) {
+  const m = /Price:\s*[^0-9\-]*([0-9]+(?:\.[0-9]+)?)/.exec(details);
+  if (!m) return 0;
+  const v = Number(m[1]);
+  return Number.isFinite(v) ? v : 0;
+}
+
+function parseQtyDelta(details: string) {
+  const plus = /\+\s*(\d+)\s*\(Now:/.exec(details);
+  if (plus) return Number(plus[1]) || 0;
+  const minus = /-\s*(\d+)\s*\(Now:/.exec(details);
+  if (minus) return Number(minus[1]) || 0;
+  const alt = /Qty:\s*(\d+)/.exec(details);
+  if (alt) return Number(alt[1]) || 0;
+  return 0;
+}
+
+function parseItemName(details: string) {
+  const qtyMatch = /[-+]\s*\d+\s*\(Now:/.exec(details);
+  if (qtyMatch) {
+    const raw = details.substring(0, qtyMatch.index).trim();
+    return raw.replace(/[\s\W]+$/, "").trim();
+  }
+  const priceIndex = details.indexOf("Price:");
+  if (priceIndex > 0) {
+    return details.substring(0, priceIndex).trim();
+  }
+  return details.trim();
+}
+
+function previousDayKey(now: Date, offsetMinutes: number) {
+  const p = localDatePartsFromOffset(now, offsetMinutes);
+  const localMidnightUtcMs = Date.UTC(p.y, p.m - 1, p.day, 0, 0, 0, 0);
+  const prevDayUtcMs = localMidnightUtcMs - 24 * 60 * 60 * 1000;
+  return dayKeyFromOffsetDate(new Date(prevDayUtcMs), offsetMinutes);
 }
 
 function hashResetToken(rawToken: string) {
@@ -266,6 +455,176 @@ async function requireApprovedAdmin(
         ? "ACCOUNT_SUSPENDED"
         : "ACCOUNT_PENDING";
   return res.status(403).json({ code, message: "Admin account is not approved." });
+}
+
+let reportJobRunning = false;
+async function runDailyReportJob() {
+  if (reportJobRunning) return;
+  reportJobRunning = true;
+
+  try {
+    const users = await pool.query(
+      `
+      SELECT id, business_id, username, tz_offset_minutes, currency_code, currency_symbol
+      FROM users
+      WHERE role='USER' AND is_active=TRUE
+      `
+    );
+
+    for (const u of users.rows) {
+      const userId = u.id as string;
+      const businessId = u.business_id as string | null;
+      const username = (u.username ?? "").toString().trim();
+      if (!businessId || !username) continue;
+
+      const offset = clampTzOffsetMinutes(Number(u.tz_offset_minutes ?? 0));
+      const reportDayKey = previousDayKey(new Date(), offset);
+
+      const state = await pool.query(
+        `SELECT last_sent_day FROM user_report_state WHERE user_id=$1`,
+        [userId]
+      );
+      if (state.rows[0]?.last_sent_day === reportDayKey) continue;
+
+      const range = utcRangeForLocalDay(reportDayKey, offset);
+      const acts = await pool.query(
+        `
+        SELECT type, details, at
+        FROM user_activity
+        WHERE user_id=$1 AND at >= $2 AND at < $3
+        ORDER BY at ASC
+        `,
+        [userId, range.startUtc, range.endUtc]
+      );
+
+      const ordered = acts.rows ?? [];
+      let totalItems = 0;
+      let totalStockOut = 0;
+      const stockIns: any[] = [];
+      const stockOuts: any[] = [];
+
+      for (const it of ordered) {
+        const type = (it.type ?? "").toString();
+        const details = (it.details ?? "").toString();
+        const at = (it.at ?? new Date().toISOString()).toString();
+
+        if (type === "user_stock_in") {
+          const qty = parseQtyDelta(details);
+          if (qty > 0) {
+            totalItems += qty;
+            stockIns.push({
+              itemName: parseItemName(details),
+              qty,
+              at,
+            });
+          }
+        }
+
+        if (type === "user_sold") {
+          const qty = parseQtyDelta(details);
+          const price = parseSoldPrice(details);
+          if (qty > 0) {
+            totalItems += qty;
+            totalStockOut += price;
+            stockOuts.push({
+              itemName: parseItemName(details),
+              qty,
+              price,
+              at,
+            });
+          }
+        }
+      }
+
+      const expRes = await pool.query(
+        `
+        SELECT data
+        FROM user_expenses
+        WHERE user_id=$1 AND day_key=$2
+        LIMIT 1
+        `,
+        [userId, reportDayKey]
+      );
+
+      const expData = expRes.rows[0]?.data ?? {};
+      const names = Array.isArray(expData.names) ? expData.names : [];
+      const amounts = Array.isArray(expData.amounts) ? expData.amounts : [];
+
+      const expenses: any[] = [];
+      let totalExpenses = 0;
+      const count = Math.max(names.length, amounts.length);
+      for (let i = 0; i < count; i += 1) {
+        const name = String(names[i] ?? "").trim();
+        const rawAmount = String(amounts[i] ?? "").trim();
+        const cleaned = rawAmount.replace(/[^0-9.\-]/g, "");
+        const v = Number(cleaned) || 0;
+        if (!name && v === 0) continue;
+        expenses.push({ name: name || "Expense", amount: v });
+        totalExpenses += Math.abs(v);
+      }
+
+      const finalTotal = totalStockOut - totalExpenses;
+      if (totalItems === 0 && finalTotal === 0) continue;
+
+      const adminRes = await pool.query(
+        `SELECT id FROM users WHERE business_id=$1 AND role='ADMIN' AND status='APPROVED' ORDER BY created_at ASC LIMIT 1`,
+        [businessId]
+      );
+      let adminId = adminRes.rows[0]?.id as string | undefined;
+      if (!adminId) {
+        const fallback = await pool.query(
+          `SELECT id FROM users WHERE business_id=$1 AND role='ADMIN' ORDER BY created_at ASC LIMIT 1`,
+          [businessId]
+        );
+        adminId = fallback.rows[0]?.id as string | undefined;
+      }
+      if (!adminId) continue;
+
+      const currencyCode = (u.currency_code ?? "USD").toString().trim() || "USD";
+      const currencySymbol = (u.currency_symbol ?? "$").toString().trim() || "$";
+      const sentAtIso = new Date().toISOString();
+
+      await pool.query(
+        `
+        INSERT INTO admin_reports (
+          business_id, admin_id, user_id, username, currency_symbol, currency_code, sent_at,
+          stock_ins, stock_outs, expenses, total_stock_out, total_expenses, final_total
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10::jsonb, $11, $12, $13)
+        `,
+        [
+          businessId,
+          adminId,
+          userId,
+          username,
+          currencySymbol,
+          currencyCode,
+          sentAtIso,
+          JSON.stringify(stockIns),
+          JSON.stringify(stockOuts),
+          JSON.stringify(expenses),
+          totalStockOut,
+          totalExpenses,
+          finalTotal,
+        ]
+      );
+
+      await pool.query(
+        `
+        INSERT INTO user_report_state (user_id, last_sent_day, last_sent_at)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (user_id)
+        DO UPDATE SET last_sent_day = EXCLUDED.last_sent_day,
+                      last_sent_at = EXCLUDED.last_sent_at
+        `,
+        [userId, reportDayKey, sentAtIso]
+      );
+    }
+  } catch (e) {
+    console.error("Report job failed:", e);
+  } finally {
+    reportJobRunning = false;
+  }
 }
 
 /* -------------------- routes -------------------- */
@@ -498,13 +857,22 @@ app.post("/auth/login", async (req, res) => {
     username: z.string().min(2).optional(),
     businessCode: z.string().min(3).max(3).optional(),
     businessCode3: z.string().min(3).max(3).optional(),
+    tzOffsetMinutes: z.number().optional(),
     password: z.string().min(6),
   });
 
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json(parsed.error.flatten());
 
-  const { role, email, username, password, businessCode, businessCode3 } = parsed.data;
+  const {
+    role,
+    email,
+    username,
+    password,
+    businessCode,
+    businessCode3,
+    tzOffsetMinutes,
+  } = parsed.data;
 
   if (!email && !username) {
     return res
@@ -619,6 +987,16 @@ app.post("/auth/login", async (req, res) => {
     businessId: userBusinessId,
     username: user.username ?? undefined,
   });
+
+  if (typeof tzOffsetMinutes === "number") {
+    const offset = clampTzOffsetMinutes(tzOffsetMinutes);
+    await pool.query(
+      `UPDATE users SET tz_offset_minutes=$1, last_seen_at=now() WHERE id=$2`,
+      [offset, user.id]
+    );
+  } else {
+    await pool.query(`UPDATE users SET last_seen_at=now() WHERE id=$1`, [user.id]);
+  }
 
   return res.json({ ok: true, token, businessId: userBusinessId, user: publicUser(user) });
 });
@@ -761,6 +1139,320 @@ app.delete("/admin/users/:username", requireAuth, requireAdmin, requireApprovedA
 });
 
 /**
+ * POST /user/prefs
+ * Updates user timezone + currency (auth required, role USER).
+ */
+app.post("/user/prefs", requireAuth, async (req, res) => {
+  const jwtUser = (req as any).user as { userId: string; role: string };
+  if (jwtUser.role !== "USER") return res.status(403).json({ error: "User only" });
+
+  const schema = z.object({
+    tzOffsetMinutes: z.number().optional(),
+    currencyCode: z.string().optional(),
+    currencySymbol: z.string().optional(),
+  });
+
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Invalid input" });
+
+  const { tzOffsetMinutes, currencyCode, currencySymbol } = parsed.data;
+  const offset =
+    typeof tzOffsetMinutes === "number"
+      ? clampTzOffsetMinutes(tzOffsetMinutes)
+      : null;
+
+  await pool.query(
+    `
+    UPDATE users
+    SET tz_offset_minutes = COALESCE($1, tz_offset_minutes),
+        currency_code = COALESCE(NULLIF($2, ''), currency_code),
+        currency_symbol = COALESCE(NULLIF($3, ''), currency_symbol),
+        last_seen_at = now()
+    WHERE id = $4
+    `,
+    [offset, currencyCode ?? "", currencySymbol ?? "", jwtUser.userId]
+  );
+
+  return res.json({ ok: true });
+});
+
+/**
+ * POST /user/activity
+ * Stores user activity for server reports (auth required, role USER).
+ */
+app.post("/user/activity", requireAuth, async (req, res) => {
+  const jwtUser = (req as any).user as { userId: string; businessId: string; role: string };
+  if (jwtUser.role !== "USER") return res.status(403).json({ error: "User only" });
+
+  const schema = z.object({
+    type: z.string().min(1),
+    title: z.string().min(1),
+    details: z.string().min(1),
+    at: z.string().optional(),
+  });
+
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Invalid input" });
+
+  const { type, title, details, at } = parsed.data;
+  const atIso = at ? new Date(at).toISOString() : new Date().toISOString();
+
+  await pool.query(
+    `
+    INSERT INTO user_activity (business_id, user_id, type, title, details, at)
+    VALUES ($1, $2, $3, $4, $5, $6)
+    `,
+    [jwtUser.businessId, jwtUser.userId, type, title, details, atIso]
+  );
+
+  return res.json({ ok: true });
+});
+
+/**
+ * POST /user/expenses
+ * Stores daily expense snapshot for server reports (auth required, role USER).
+ */
+app.post("/user/expenses", requireAuth, async (req, res) => {
+  const jwtUser = (req as any).user as { userId: string; businessId: string; role: string };
+  if (jwtUser.role !== "USER") return res.status(403).json({ error: "User only" });
+
+  const schema = z.object({
+    names: z.array(z.string()).optional(),
+    amounts: z.array(z.string()).optional(),
+    savedAt: z.string().optional(),
+    tzOffsetMinutes: z.number().optional(),
+    currencyCode: z.string().optional(),
+    currencySymbol: z.string().optional(),
+  });
+
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Invalid input" });
+
+  const { names, amounts, savedAt, tzOffsetMinutes, currencyCode, currencySymbol } =
+    parsed.data;
+  const offset =
+    typeof tzOffsetMinutes === "number"
+      ? clampTzOffsetMinutes(tzOffsetMinutes)
+      : 0;
+  const savedAtIso = savedAt ? new Date(savedAt).toISOString() : new Date().toISOString();
+  const dayKey = dayKeyFromOffsetDate(new Date(savedAtIso), offset);
+
+  const data = {
+    names: (names ?? []).map((v) => v.toString()),
+    amounts: (amounts ?? []).map((v) => v.toString()),
+    savedAt: savedAtIso,
+  };
+
+  await pool.query(
+    `
+    INSERT INTO user_expenses (business_id, user_id, day_key, data, saved_at)
+    VALUES ($1, $2, $3, $4::jsonb, $5)
+    ON CONFLICT (user_id, day_key)
+    DO UPDATE SET data = EXCLUDED.data, saved_at = EXCLUDED.saved_at
+    `,
+    [jwtUser.businessId, jwtUser.userId, dayKey, JSON.stringify(data), savedAtIso]
+  );
+
+  if (currencyCode || currencySymbol || typeof tzOffsetMinutes === "number") {
+    await pool.query(
+      `
+      UPDATE users
+      SET tz_offset_minutes = COALESCE($1, tz_offset_minutes),
+          currency_code = COALESCE(NULLIF($2, ''), currency_code),
+          currency_symbol = COALESCE(NULLIF($3, ''), currency_symbol),
+          last_seen_at = now()
+      WHERE id = $4
+      `,
+      [
+        typeof tzOffsetMinutes === "number" ? offset : null,
+        currencyCode ?? "",
+        currencySymbol ?? "",
+        jwtUser.userId,
+      ]
+    );
+  }
+
+  return res.json({ ok: true, dayKey });
+});
+
+/**
+ * POST /user/reports
+ * User sends daily report (auth required, role USER).
+ */
+app.post("/user/reports", requireAuth, async (req, res) => {
+  const jwtUser = (req as any).user as { userId: string; businessId: string; role: string; username?: string };
+  if (jwtUser.role !== "USER") return res.status(403).json({ error: "User only" });
+
+  const schema = z.object({
+    username: z.string().min(1),
+    sentAt: z.string().optional(),
+    currencySymbol: z.string().min(1),
+    currencyCode: z.string().min(1),
+    totalStockOut: z.number().optional(),
+    totalExpenses: z.number().optional(),
+    finalTotal: z.number().optional(),
+    stockIns: z.array(z.any()).optional(),
+    stockOuts: z.array(z.any()).optional(),
+    expenses: z.array(z.any()).optional(),
+  });
+
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Invalid input" });
+
+  const {
+    username,
+    sentAt,
+    currencySymbol,
+    currencyCode,
+    totalStockOut,
+    totalExpenses,
+    finalTotal,
+    stockIns,
+    stockOuts,
+    expenses,
+  } = parsed.data;
+
+  const safeStockIns = (stockIns ?? []).map((r: any) => ({
+    itemName: (r?.itemName ?? "").toString(),
+    qty: Number(r?.qty ?? 0),
+    at: (r?.at ?? new Date().toISOString()).toString(),
+  }));
+  const safeStockOuts = (stockOuts ?? []).map((r: any) => ({
+    itemName: (r?.itemName ?? "").toString(),
+    qty: Number(r?.qty ?? 0),
+    price: Number(r?.price ?? 0),
+    at: (r?.at ?? new Date().toISOString()).toString(),
+  }));
+  const safeExpenses = (expenses ?? []).map((r: any) => ({
+    name: (r?.name ?? "").toString(),
+    amount: Number(r?.amount ?? 0),
+  }));
+
+  const totalOut = Number(totalStockOut ?? 0);
+  const totalExp = Number(totalExpenses ?? 0);
+  const final = Number(finalTotal ?? (totalOut - totalExp));
+  const sentAtIso = sentAt ? new Date(sentAt).toISOString() : new Date().toISOString();
+
+  const adminRes = await pool.query(
+    `SELECT id FROM users WHERE business_id=$1 AND role='ADMIN' AND status='APPROVED' ORDER BY created_at ASC LIMIT 1`,
+    [jwtUser.businessId]
+  );
+  let adminId = adminRes.rows[0]?.id as string | undefined;
+  if (!adminId) {
+    const fallback = await pool.query(
+      `SELECT id FROM users WHERE business_id=$1 AND role='ADMIN' ORDER BY created_at ASC LIMIT 1`,
+      [jwtUser.businessId]
+    );
+    adminId = fallback.rows[0]?.id as string | undefined;
+  }
+  if (!adminId) return res.status(409).json({ error: "Admin not found" });
+
+  try {
+    await pool.query(
+      `UPDATE users SET currency_code=$1, currency_symbol=$2 WHERE id=$3`,
+      [currencyCode, currencySymbol, jwtUser.userId]
+    );
+
+    const tzRes = await pool.query(
+      `SELECT tz_offset_minutes FROM users WHERE id=$1`,
+      [jwtUser.userId]
+    );
+    const offset = clampTzOffsetMinutes(Number(tzRes.rows[0]?.tz_offset_minutes ?? 0));
+    const sentDayKey = dayKeyFromOffsetDate(new Date(sentAtIso), offset);
+
+    const result = await pool.query(
+      `
+      INSERT INTO admin_reports (
+        business_id, admin_id, user_id, username, currency_symbol, currency_code, sent_at,
+        stock_ins, stock_outs, expenses, total_stock_out, total_expenses, final_total
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10::jsonb, $11, $12, $13)
+      RETURNING id
+      `,
+      [
+        jwtUser.businessId,
+        adminId,
+        jwtUser.userId,
+        username.trim(),
+        currencySymbol,
+        currencyCode,
+        sentAtIso,
+        JSON.stringify(safeStockIns),
+        JSON.stringify(safeStockOuts),
+        JSON.stringify(safeExpenses),
+        totalOut,
+        totalExp,
+        final,
+      ]
+    );
+
+    await pool.query(
+      `
+      INSERT INTO user_report_state (user_id, last_sent_day, last_sent_at)
+      VALUES ($1, $2, $3)
+      ON CONFLICT (user_id)
+      DO UPDATE SET last_sent_day = EXCLUDED.last_sent_day,
+                    last_sent_at = EXCLUDED.last_sent_at
+      `,
+      [jwtUser.userId, sentDayKey, sentAtIso]
+    );
+
+    return res.json({ ok: true, reportId: result.rows[0]?.id ?? null });
+  } catch (e) {
+    return res.status(500).json({ error: "Report save failed" });
+  }
+});
+
+/**
+ * GET /admin/reports
+ * Admin-only. Returns reports for this admin (no cross-admin mixing).
+ */
+app.get("/admin/reports", requireAuth, requireAdmin, requireApprovedAdmin, async (req, res) => {
+  const jwtUser = (req as any).user as { businessId: string; userId: string };
+  const result = await pool.query(
+    `
+    SELECT id, username, sent_at, currency_symbol, currency_code,
+           stock_ins, stock_outs, expenses, total_stock_out, total_expenses, final_total
+    FROM admin_reports
+    WHERE business_id=$1 AND admin_id=$2
+    ORDER BY sent_at DESC
+    `,
+    [jwtUser.businessId, jwtUser.userId]
+  );
+  return res.json({ ok: true, reports: result.rows.map(adminReportRow) });
+});
+
+/**
+ * GET /admin/reports/count
+ * Admin-only. Returns count (optional ?date=YYYY-MM-DD).
+ */
+app.get("/admin/reports/count", requireAuth, requireAdmin, requireApprovedAdmin, async (req, res) => {
+  const jwtUser = (req as any).user as { businessId: string; userId: string };
+  const date = (req.query.date ?? "").toString().trim();
+  if (date) {
+    const result = await pool.query(
+      `
+      SELECT count(*)::int AS count
+      FROM admin_reports
+      WHERE business_id=$1 AND admin_id=$2 AND sent_at::date = $3
+      `,
+      [jwtUser.businessId, jwtUser.userId, date]
+    );
+    return res.json({ ok: true, count: Number(result.rows[0]?.count ?? 0) });
+  }
+
+  const result = await pool.query(
+    `
+    SELECT count(*)::int AS count
+    FROM admin_reports
+    WHERE business_id=$1 AND admin_id=$2
+    `,
+    [jwtUser.businessId, jwtUser.userId]
+  );
+  return res.json({ ok: true, count: Number(result.rows[0]?.count ?? 0) });
+});
+
+/**
  * GET /admins/me/status
  */
 app.get("/admins/me/status", requireAuth, requireAdmin, async (req, res) => {
@@ -786,14 +1478,29 @@ app.get("/admins/me/status", requireAuth, requireAdmin, async (req, res) => {
  */
 app.delete("/admins/me", requireAuth, requireAdmin, async (req, res) => {
   const jwtUser = (req as any).user as { userId: string; businessId: string };
-  const row = await pool.query(
-    `SELECT status FROM users WHERE id=$1 AND role='ADMIN' LIMIT 1`,
-    [jwtUser.userId]
-  );
-  const status = row.rows[0]?.status ?? "PENDING";
-  if (!["PENDING", "DECLINED", "SUSPENDED"].includes(status)) {
-    return res.status(403).json({ code: "ACCOUNT_APPROVED", message: "Approved admins cannot self-delete." });
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(`DELETE FROM password_resets WHERE user_id=$1`, [jwtUser.userId]);
+    await client.query(`DELETE FROM users WHERE business_id=$1`, [jwtUser.businessId]);
+    await client.query(`DELETE FROM businesses WHERE id=$1`, [jwtUser.businessId]);
+    await client.query("COMMIT");
+    return res.json({ ok: true });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    return res.status(500).json({ error: "Delete failed" });
+  } finally {
+    client.release();
   }
+});
+
+/**
+ * DELETE /admin/delete-account
+ * Admin self-delete (alias)
+ */
+app.delete("/admin/delete-account", requireAuth, requireAdmin, async (req, res) => {
+  const jwtUser = (req as any).user as { userId: string; businessId: string };
 
   const client = await pool.connect();
   try {
@@ -823,7 +1530,8 @@ const headAdminListHandler = async (req: express.Request, res: express.Response)
   const result = await pool.query(
     `
     SELECT u.id, u.email, u.status, u.desired_user_limit, u.approved_user_limit,
-           u.created_at, u.reviewed_at, u.status_reason, b.name AS business_name, b.code3
+           u.created_at, u.reviewed_at, u.status_reason, b.name AS business_name, b.code3,
+           (SELECT count(*) FROM admin_reports ar WHERE ar.admin_id = u.id) AS report_count
     FROM users u
     JOIN businesses b ON b.id = u.business_id
     WHERE u.role='ADMIN' ${filter}
@@ -835,6 +1543,54 @@ const headAdminListHandler = async (req: express.Request, res: express.Response)
 };
 app.get("/head-admin/admins", requireHeadAdmin, headAdminListHandler);
 app.get("/api/head-admin/admins", requireHeadAdmin, headAdminListHandler);
+
+/**
+ * GET /head-admin/admins/search?email=<email>
+ * Returns admin rows matching email (case-insensitive).
+ */
+const headAdminSearchHandler = async (req: express.Request, res: express.Response) => {
+  const emailRaw = (req.query.email ?? "").toString().trim();
+  if (!emailRaw) return res.json({ ok: true, results: [] });
+
+  const result = await pool.query(
+    `
+    SELECT u.id, u.email, u.role, u.status, u.desired_user_limit, u.approved_user_limit,
+           u.created_at, b.name AS business_name, b.code3
+    FROM users u
+    JOIN businesses b ON b.id = u.business_id
+    WHERE u.role='ADMIN' AND u.email ILIKE $1
+    ORDER BY u.created_at DESC
+    `,
+    [emailRaw]
+  );
+
+  return res.json({ ok: true, results: result.rows.map(headAdminSearchRow) });
+};
+app.get("/head-admin/admins/search", requireHeadAdmin, headAdminSearchHandler);
+app.get("/api/head-admin/admins/search", requireHeadAdmin, headAdminSearchHandler);
+
+/**
+ * GET /head-admin/admins/all-emails
+ * Returns up to 200 admin emails + status.
+ */
+const headAdminAllEmailsHandler = async (_req: express.Request, res: express.Response) => {
+  const result = await pool.query(
+    `
+    SELECT email, status
+    FROM users
+    WHERE role='ADMIN' AND email IS NOT NULL
+    ORDER BY created_at DESC
+    LIMIT 200
+    `
+  );
+  const results = result.rows.map((row: any) => ({
+    email: row.email,
+    status: row.status,
+  }));
+  return res.json({ ok: true, results });
+};
+app.get("/head-admin/admins/all-emails", requireHeadAdmin, headAdminAllEmailsHandler);
+app.get("/api/head-admin/admins/all-emails", requireHeadAdmin, headAdminAllEmailsHandler);
 
 const headAdminApproveHandler = async (req: express.Request, res: express.Response) => {
   const schema = z.object({
@@ -1041,6 +1797,9 @@ async function start() {
     await pool.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto;`);
 
     await ensureTables();
+
+    runDailyReportJob();
+    setInterval(runDailyReportJob, 60 * 1000);
 
     app.listen(PORT, "0.0.0.0", () => {
       console.log(`✅ Running on port ${PORT}`);
